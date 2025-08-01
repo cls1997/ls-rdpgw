@@ -1,0 +1,3 @@
+[submodule "rdpgw"]
+	path = rdpgw
+	url = git@github.com:bolkedebruin/rdpgw.git
