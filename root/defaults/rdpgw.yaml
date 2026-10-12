@@ -1,0 +1,40 @@
+# 首次启动会复制此文件并生成独立的随机密钥；后续启动不覆盖已有配置。
+# 请先替换所有 CHANGE_ME 值，再重启容器。
+Server:
+  # 默认使用 OpenID Connect；local/PAM 需要自行部署 rdpgw-auth 服务。
+  Authentication:
+    - openid
+  # enable 使用证书；disable 仅适合前置代理终止 TLS；auto 可使用 ACME。
+  Tls: enable
+  Port: 443
+  # 客户端可访问的网关域名（例如 https://rdpgw.example.com）。
+  GatewayAddress: CHANGE_ME_GATEWAY
+  # 镜像自签名证书仅供测试。生产环境应挂载受信任证书到 /config 并修改路径。
+  CertFile: /opt/rdpgw/server.pem
+  KeyFile: /opt/rdpgw/key.pem
+  # 允许连接的远程桌面地址，禁止使用任意主机策略作为默认值。
+  Hosts:
+    - CHANGE_ME_HOST:3389
+  HostSelection: roundrobin
+  # 初始化时生成，持久保存；多副本部署需要共享这些密钥。
+  SessionKey: GENERATE_SESSION_KEY
+  SessionEncryptionKey: GENERATE_SESSION_ENCRYPTION_KEY
+  SessionStore: cookie
+OpenId:
+  # 填写认证服务的 issuer URL、客户端 ID 和客户端密钥。
+  # 在认证服务中配置回调地址：https://你的网关域名/callback。
+  ProviderUrl: CHANGE_ME_PROVIDER_URL
+  ClientId: CHANGE_ME_CLIENT_ID
+  ClientSecret: CHANGE_ME_CLIENT_SECRET
+Caps:
+  TokenAuth: true
+  IdleTimeout: 10
+  EnableClipboard: true
+Security:
+  PAATokenSigningKey: GENERATE_PAA_KEY
+  PAATokenEncryptionKey: GENERATE_PAA_ENCRYPTION_KEY
+  UserTokenEncryptionKey: GENERATE_USER_KEY
+  UserTokenSigningKey: GENERATE_USER_SIGNING_KEY
+  EnableUserToken: true
+  # 前置代理/NAT 场景需要按实际网络情况评估是否关闭 IP 校验。
+  VerifyClientIp: true

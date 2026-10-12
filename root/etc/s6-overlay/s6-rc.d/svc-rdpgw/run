@@ -1,12 +1,13 @@
 #!/usr/bin/with-contenv bash
 # shellcheck shell=bash
+set -e
 
+# Keep the service directory for s6-notifyoncheck to locate supervise/ and data/check.
+# Only its child changes directory, before replacing itself with the gateway.
 if [[ -z ${LSIO_NON_ROOT_USER} ]]; then
-    exec \
-        s6-notifyoncheck -d -n 300 -w 1000 \
-            cd /opt/rdpgw s6-setuidgid abc /opt/rdpgw/rdpgw -c /config/rdpgw.yaml
+    exec s6-notifyoncheck -d -n 300 -w 1000 \
+        /bin/bash -c 'cd /opt/rdpgw && exec s6-setuidgid abc /opt/rdpgw/rdpgw -c /config/rdpgw.yaml'
 else
-    exec \
-        s6-notifyoncheck -d -n 300 -w 1000 \
-            cd /opt/rdpgw /opt/rdpgw/rdpgw -c /config/rdpgw.yaml
+    exec s6-notifyoncheck -d -n 300 -w 1000 \
+        /bin/bash -c 'cd /opt/rdpgw && exec /opt/rdpgw/rdpgw -c /config/rdpgw.yaml'
 fi

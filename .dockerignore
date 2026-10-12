@@ -4,3 +4,10 @@
 .gitattributes
 READMETEMPLATE.md
 README.md
+
+# Python verification artifacts
+__pycache__/
+*.pyc
+
+# Local test configuration and credentials
+.local/

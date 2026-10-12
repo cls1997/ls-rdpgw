@@ -65,3 +65,10 @@ Icon[]
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# Python verification artifacts
+__pycache__/
+*.pyc
+
+# Local test configuration and credentials
+.local/

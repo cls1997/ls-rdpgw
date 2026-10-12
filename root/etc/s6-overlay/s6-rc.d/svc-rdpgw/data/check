@@ -1,9 +1,2 @@
 #!/bin/bash
-
-WEB_PORT=$(grep ' Port:' '/config/rdpgw.yaml' | awk -F ':' '{print $2}')
-
-if curl -sf "http://localhost:${WEB_PORT}/" > /dev/null; then
-    exit 0
-else
-    exit 1
-fi
+exec python3 /usr/local/lib/rdpgw/config.py check

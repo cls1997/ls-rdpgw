@@ -1,7 +1,10 @@
 #!/usr/bin/with-contenv bash
 # shellcheck shell=bash
+set -e
 
+python3 /usr/local/lib/rdpgw/config.py init
 if [[ -z ${LSIO_NON_ROOT_USER} ]]; then
-    lsiown -R abc:abc \
-        /config
+    lsiown -R abc:abc /config
+    lsiown abc:abc /opt/rdpgw/key.pem
 fi
+python3 /usr/local/lib/rdpgw/config.py validate
