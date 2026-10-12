@@ -5,12 +5,16 @@ FROM golang:1.22-bookworm AS builder
 
 # install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libc6-dev libpam0g-dev openssl ca-certificates && \
+    gcc libc6-dev libpam0g-dev openssl ca-certificates patch && \
     rm -rf /var/lib/apt/lists/*
 
 # copy source code
 COPY rdpgw/ /src
 WORKDIR /src
+
+# Keep local features outside the pinned upstream submodule. Reject patch drift.
+COPY patches/landing.patch /tmp/landing.patch
+RUN patch --batch --forward --fuzz=0 -p1 < /tmp/landing.patch
 
 # generate certificates
 RUN mkdir -p /opt/rdpgw && cd /opt/rdpgw && \
@@ -25,6 +29,7 @@ RUN mkdir -p /opt/rdpgw && cd /opt/rdpgw && \
 # build applications
 ARG CACHEBUST
 RUN go mod tidy -compat=1.19 && \
+    CGO_ENABLED=0 GOOS=linux go test ./cmd/rdpgw/... && \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -tags '' -ldflags '' -o '/opt/rdpgw/rdpgw' ./cmd/rdpgw && \
     CGO_ENABLED=1 GOOS=linux go build -trimpath -tags '' -ldflags '' -o '/opt/rdpgw/rdpgw-auth' ./cmd/auth && \
     chmod +x /opt/rdpgw/rdpgw && \

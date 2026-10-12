@@ -1,0 +1,1260 @@
+diff --git a/cmd/rdpgw/main.go b/cmd/rdpgw/main.go
+--- a/cmd/rdpgw/main.go
++++ b/cmd/rdpgw/main.go
+@@ -110,10 +110,15 @@
+ 		RdpOpts: web.RdpOpts{
+ 			UsernameTemplate: conf.Client.UsernameTemplate,
+ 			SplitUserDomain:  conf.Client.SplitUserDomain,
+-			NoUsername: conf.Client.NoUsername,
++			NoUsername:       conf.Client.NoUsername,
+ 		},
+ 		GatewayAddress: url,
+ 		TemplateFile:   conf.Client.Defaults,
++		RedirectCaps: web.RedirectCaps{
++			Clipboard: !conf.Caps.DisableRedirect && (conf.Caps.RedirectAll || conf.Caps.EnableClipboard),
++			Drive:     !conf.Caps.DisableRedirect && (conf.Caps.RedirectAll || conf.Caps.EnableDrive),
++			Printer:   !conf.Caps.DisableRedirect && (conf.Caps.RedirectAll || conf.Caps.EnablePrinter),
++		},
+ 	}
+ 
+ 	if conf.Caps.TokenAuth {
+@@ -217,6 +222,7 @@
+ 	if conf.Server.OpenIDEnabled() {
+ 		log.Printf("enabling openid extended authentication")
+ 		o := initOIDC(url)
++		r.Handle("/", o.Authenticated(http.HandlerFunc(h.HandleLanding))).Methods("GET")
+ 		r.Handle("/connect", o.Authenticated(http.HandlerFunc(h.HandleDownload)))
+ 		r.HandleFunc("/callback", o.HandleCallback)
+ 
+diff --git a/cmd/rdpgw/rdp/rdp.go b/cmd/rdpgw/rdp/rdp.go
+--- a/cmd/rdpgw/rdp/rdp.go
++++ b/cmd/rdpgw/rdp/rdp.go
+@@ -43,6 +43,7 @@
+ 	GatewayCredentialMethod               int    `rdp:"gatewayprofileusagemethod" default:"0"`
+ 	GatewayUsageMethod                    int    `rdp:"gatewayusagemethod" default:"0"`
+ 	GatewayAccessToken                    string `rdp:"gatewayaccesstoken"`
++	PromptForCredentials                  bool   `rdp:"prompt for credentials" default:"false"`
+ 	PromptCredentialsOnce                 bool   `rdp:"promptcredentialonce" default:"true"`
+ 	AuthenticationLevel                   int    `rdp:"authentication level" default:"3"`
+ 	EnableCredSSPSupport                  bool   `rdp:"enablecredsspsupport" default:"true"`
+@@ -134,6 +135,11 @@
+ 	}, nil
+ }
+ 
++// MarkExplicit preserves intentionally empty, zero and default-valued overrides.
++func (rb *Builder) MarkExplicit(fields ...string) {
++	rb.Metadata.Keys = append(rb.Metadata.Keys, fields...)
++}
++
+ func (rb *Builder) String() string {
+ 	var sb strings.Builder
+ 
+@@ -207,9 +213,14 @@
+ }
+ 
+ func isSet(f *structs.Field, metadata mapstructure.Metadata) bool {
++	// Preserve the existing template output while also honoring explicit defaults.
+ 	for _, v := range metadata.Unset {
+ 		if v == f.Name() {
+-			log.Printf("field %s is unset", f.Name())
++			return true
++		}
++	}
++	for _, v := range metadata.Keys {
++		if v == f.Name() || v == f.Tag("rdp") {
+ 			return true
+ 		}
+ 	}
+diff --git a/cmd/rdpgw/security/basic.go b/cmd/rdpgw/security/basic.go
+--- a/cmd/rdpgw/security/basic.go
++++ b/cmd/rdpgw/security/basic.go
+@@ -4,6 +4,7 @@
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/target"
+ 	"log"
+ 	"strings"
+ )
+@@ -28,8 +29,10 @@
+ 
+ 		log.Printf("Checking host for user %s", s.User.UserName())
+ 		for _, h := range Hosts {
+-			h = strings.Replace(h, "{{ preferred_username }}", s.User.UserName(), 1)
+-			if h == host {
++			h = strings.ReplaceAll(h, "{{ preferred_username }}", s.User.UserName())
++			allowed, err := target.Address(h)
++			requested, requestErr := target.Address(host)
++			if err == nil && requestErr == nil && allowed == requested {
+ 				return true, nil
+ 			}
+ 		}
+diff --git a/cmd/rdpgw/security/jwt.go b/cmd/rdpgw/security/jwt.go
+--- a/cmd/rdpgw/security/jwt.go
++++ b/cmd/rdpgw/security/jwt.go
+@@ -6,6 +6,7 @@
+ 	"fmt"
+ 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/identity"
+ 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/protocol"
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/target"
+ 	"github.com/coreos/go-oidc/v3/oidc"
+ 	"github.com/go-jose/go-jose/v3"
+ 	"github.com/go-jose/go-jose/v3/jwt"
+@@ -29,6 +30,7 @@
+ 
+ type customClaims struct {
+ 	RemoteServer string `json:"remoteServer"`
++	HostUserName string `json:"hostUserName,omitempty"`
+ 	ClientIP     string `json:"clientIp"`
+ 	AccessToken  string `json:"accessToken"`
+ }
+@@ -40,7 +42,9 @@
+ 			return false, errors.New("no valid session info found in context")
+ 		}
+ 
+-		if tunnel.TargetServer != host {
++		expected, expectedErr := target.Address(tunnel.TargetServer)
++		requested, requestedErr := target.Address(host)
++		if expectedErr != nil || requestedErr != nil || expected != requested {
+ 			log.Printf("Client specified host %s does not match token host %s", host, tunnel.TargetServer)
+ 			return false, nil
+ 		}
+@@ -109,6 +113,10 @@
+ 	tunnel.TargetServer = custom.RemoteServer
+ 	tunnel.RemoteAddr = custom.ClientIP
+ 	tunnel.User.SetUserName(user.Subject)
++	// Bind host templates to the authenticated browser identity carried in the signed token.
++	if custom.HostUserName != "" {
++		tunnel.User.SetUserName(custom.HostUserName)
++	}
+ 
+ 	return true, nil
+ }
+@@ -132,6 +140,7 @@
+ 	id := identity.FromCtx(ctx)
+ 	private := customClaims{
+ 		RemoteServer: server,
++		HostUserName: id.UserName(),
+ 		ClientIP:     id.GetAttribute(identity.AttrClientIp).(string),
+ 		AccessToken:  id.GetAttribute(identity.AttrAccessToken).(string),
+ 	}
+diff --git a/cmd/rdpgw/security/landing_test.go b/cmd/rdpgw/security/landing_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/rdpgw/security/landing_test.go
+@@ -0,0 +1,65 @@
++package security
++
++import (
++	"context"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/identity"
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/protocol"
++	"github.com/go-jose/go-jose/v3/jwt"
++)
++
++func TestLandingTargetPolicy(t *testing.T) {
++	oldHosts, oldSelection, oldIP := Hosts, HostSelection, VerifyClientIP
++	defer func() { Hosts, HostSelection, VerifyClientIP = oldHosts, oldSelection, oldIP }()
++	Hosts = []string{"desktop", "my-{{ preferred_username }}-host:3390", "[::1]"}
++	HostSelection = "roundrobin"
++	VerifyClientIP = false
++	tunnel := protocol.Tunnel{TargetServer: "desktop", User: identity.NewUser()}
++	tunnel.User.SetUserName("alice")
++	ctx := context.WithValue(context.Background(), protocol.CtxTunnel, &tunnel)
++	for _, host := range []string{"desktop:3389", "my-alice-host:3390", "[::1]:3389"} {
++		if ok, err := CheckHost(ctx, host); !ok || err != nil {
++			t.Errorf("allowed %s: %v %v", host, ok, err)
++		}
++	}
++	for _, host := range []string{"desktop:3390", "my-bob-host:3390"} {
++		if ok, _ := CheckHost(ctx, host); ok {
++			t.Errorf("accepted %s", host)
++		}
++	}
++	if ok, err := CheckSession(CheckHost)(ctx, "desktop:3389"); !ok || err != nil {
++		t.Fatal("default port session mismatch", ok, err)
++	}
++	if ok, _ := CheckSession(CheckHost)(ctx, "desktop:3390"); ok {
++		t.Fatal("accepted different port")
++	}
++}
++
++func TestPAATokenBindsHostTemplateIdentity(t *testing.T) {
++	oldSigning := SigningKey
++	defer func() { SigningKey = oldSigning }()
++	SigningKey = []byte("01234567890123456789012345678901")
++	id := identity.NewUser()
++	id.SetUserName("alice@example.com")
++	id.SetAttribute(identity.AttrClientIp, "127.0.0.1")
++	id.SetAttribute(identity.AttrAccessToken, "test-access")
++	req := identity.AddToRequestCtx(id, httptest.NewRequest("GET", "/connect", nil))
++	raw, err := GeneratePAAToken(req.Context(), "alice", "my-alice@example.com-host:3389")
++	if err != nil {
++		t.Fatal(err)
++	}
++	parsed, err := jwt.ParseSigned(raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	standard := jwt.Claims{}
++	custom := customClaims{}
++	if err := parsed.Claims(SigningKey, &standard, &custom); err != nil {
++		t.Fatal(err)
++	}
++	if standard.Subject != "alice" || custom.HostUserName != "alice@example.com" {
++		t.Fatal("gateway identity not preserved", standard, custom)
++	}
++}
+diff --git a/cmd/rdpgw/target/target.go b/cmd/rdpgw/target/target.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/rdpgw/target/target.go
+@@ -0,0 +1,46 @@
++// Package target keeps RDP file, policy and reachability addresses consistent.
++package target
++
++import (
++	"fmt"
++	"net"
++	"strconv"
++	"strings"
++	"unicode"
++)
++
++func Address(value string) (string, error) {
++	for _, ch := range value {
++		if unicode.IsSpace(ch) || unicode.IsControl(ch) {
++			return "", fmt.Errorf("invalid target address")
++		}
++	}
++	host, port, err := net.SplitHostPort(value)
++	if err != nil {
++		switch {
++		case net.ParseIP(value) != nil:
++			host = value
++		case strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") && net.ParseIP(value[1:len(value)-1]) != nil:
++			host = value[1 : len(value)-1]
++		case !strings.ContainsAny(value, ":[]"):
++			host = value
++		default:
++			return "", fmt.Errorf("invalid target address")
++		}
++		port = "3389"
++	}
++	if host == "" || strings.ContainsAny(host, "/\\?#@{}") {
++		return "", fmt.Errorf("invalid target host")
++	}
++	n, err := strconv.Atoi(port)
++	if err != nil || n < 1 || n > 65535 {
++		return "", fmt.Errorf("invalid target port")
++	}
++	if strings.Contains(host, ":") && net.ParseIP(host) == nil {
++		return "", fmt.Errorf("invalid IPv6 target")
++	}
++	if ip := net.ParseIP(host); ip != nil {
++		host = ip.String()
++	}
++	return net.JoinHostPort(host, strconv.Itoa(n)), nil
++}
+diff --git a/cmd/rdpgw/target/target_test.go b/cmd/rdpgw/target/target_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/rdpgw/target/target_test.go
+@@ -0,0 +1,20 @@
++package target
++
++import "testing"
++
++func TestAddress(t *testing.T) {
++	cases := map[string]string{"desktop": "desktop:3389", "desktop:3390": "desktop:3390", "10.0.0.1": "10.0.0.1:3389", "10.0.0.1:3391": "10.0.0.1:3391", "::1": "[::1]:3389", "[::1]": "[::1]:3389", "[::1]:3390": "[::1]:3390", "[0:0:0:0:0:0:0:1]:3390": "[::1]:3390"}
++	for input, expected := range cases {
++		t.Run(input, func(t *testing.T) {
++			got, err := Address(input)
++			if err != nil || got != expected {
++				t.Fatalf("got %q, %v; want %q", got, err, expected)
++			}
++		})
++	}
++	for _, input := range []string{"", ":3389", "desktop:", "desktop:0", "desktop:65536", "desktop:rdp", "bad:host:3389", "https://desktop", "host\r\n", "user@host", "{{ preferred_username }}:3389", "[::1", "host name"} {
++		if got, err := Address(input); err == nil {
++			t.Errorf("accepted %q as %q", input, got)
++		}
++	}
++}
+diff --git a/cmd/rdpgw/web/context.go b/cmd/rdpgw/web/context.go
+--- a/cmd/rdpgw/web/context.go
++++ b/cmd/rdpgw/web/context.go
+@@ -26,7 +26,7 @@
+ 		}
+ 
+ 		log.Printf("Identity SessionId: %s, UserName: %s: Authenticated: %t: Path: %s",
+-			id.SessionId(), id.UserName(), id.Authenticated(), r.RequestURI)
++			id.SessionId(), id.UserName(), id.Authenticated(), r.URL.Path)
+ 
+ 		h := r.Header.Get("X-Forwarded-For")
+ 		if h != "" {
+diff --git a/cmd/rdpgw/web/landing.go b/cmd/rdpgw/web/landing.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/rdpgw/web/landing.go
+@@ -0,0 +1,159 @@
++package web
++
++import (
++	"context"
++	"crypto/rand"
++	_ "embed"
++	"encoding/base64"
++	"html/template"
++	"net"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/identity"
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/target"
++)
++
++const probeTTL = 15 * time.Second
++const probeTimeout = 2 * time.Second
++
++//go:embed landing.html
++var landingHTML string
++var landingTemplate = template.Must(template.New("landing").Parse(landingHTML))
++
++type probeResult struct {
++	Online  bool
++	Checked time.Time
++}
++type probeFlight struct {
++	done   chan struct{}
++	result probeResult
++}
++type probeCache struct {
++	mu      sync.Mutex
++	results map[string]probeResult
++	flights map[string]*probeFlight
++	slots   chan struct{}
++	dial    func(context.Context, string, string) (net.Conn, error)
++}
++
++func newProbeCache() *probeCache {
++	d := &net.Dialer{}
++	return &probeCache{results: make(map[string]probeResult), flights: make(map[string]*probeFlight), slots: make(chan struct{}, 8), dial: d.DialContext}
++}
++
++func (p *probeCache) check(ctx context.Context, address string) probeResult {
++	p.mu.Lock()
++	if result, ok := p.results[address]; ok && time.Since(result.Checked) < probeTTL {
++		p.mu.Unlock()
++		return result
++	}
++	if flight, ok := p.flights[address]; ok {
++		p.mu.Unlock()
++		select {
++		case <-flight.done:
++			return flight.result
++		case <-ctx.Done():
++			return probeResult{}
++		}
++	}
++	// Remove expired per-user targets so the cache cannot grow indefinitely.
++	for key, result := range p.results {
++		if time.Since(result.Checked) >= probeTTL {
++			delete(p.results, key)
++		}
++	}
++	flight := &probeFlight{done: make(chan struct{})}
++	p.flights[address] = flight
++	p.mu.Unlock()
++
++	result := probeResult{}
++	select {
++	case p.slots <- struct{}{}:
++		dialCtx, cancel := context.WithTimeout(ctx, probeTimeout)
++		conn, err := p.dial(dialCtx, "tcp", address)
++		cancel()
++		result = probeResult{Online: err == nil, Checked: time.Now()}
++		if conn != nil {
++			conn.Close()
++		}
++		<-p.slots
++	case <-ctx.Done():
++	}
++	p.mu.Lock()
++	flight.result = result
++	if ctx.Err() == nil && !result.Checked.IsZero() {
++		p.results[address] = result
++	}
++	delete(p.flights, address)
++	close(flight.done)
++	p.mu.Unlock()
++	return result
++}
++
++type landingHost struct {
++	Index                          int
++	Host, Address, Status, Checked string
++	Valid                          bool
++}
++type landingData struct {
++	User, Nonce string
++	Signed      bool
++	Caps        RedirectCaps
++	Hosts       []landingHost
++}
++
++func (h *Handler) HandleLanding(w http.ResponseWriter, r *http.Request) {
++	id := identity.FromRequestCtx(r)
++	if id == nil || !id.Authenticated() {
++		http.Error(w, "Unauthorized", http.StatusUnauthorized)
++		return
++	}
++	nonce := make([]byte, 18)
++	if _, err := rand.Read(nonce); err != nil {
++		http.Error(w, "Unable to render page", http.StatusInternalServerError)
++		return
++	}
++	data := landingData{User: id.UserName(), Nonce: base64.StdEncoding.EncodeToString(nonce), Signed: h.hostSelection == "signed", Caps: h.redirectCaps}
++	data.Hosts = make([]landingHost, len(h.hosts))
++	// A fixed worker pool bounds goroutines as well as network connections.
++	var workers sync.WaitGroup
++	jobs := make(chan int)
++	for n := 0; n < 8; n++ {
++		workers.Add(1)
++		go func() {
++			defer workers.Done()
++			for i := range jobs {
++				raw := h.hosts[i]
++				entry := landingHost{Index: i, Host: raw, Address: strings.ReplaceAll(raw, "{{ preferred_username }}", id.UserName()), Status: "配置无效"}
++				address, err := target.Address(entry.Address)
++				if err == nil {
++					entry.Valid, entry.Address = true, address
++					result := h.probes.check(r.Context(), address)
++					entry.Status = "不可达"
++					if result.Online {
++						entry.Status = "在线"
++					}
++					if !result.Checked.IsZero() {
++						entry.Checked = result.Checked.UTC().Format(time.RFC3339)
++					}
++				}
++				data.Hosts[i] = entry
++			}
++		}()
++	}
++	for i := range h.hosts {
++		jobs <- i
++	}
++	close(jobs)
++	workers.Wait()
++	w.Header().Set("Content-Type", "text/html; charset=utf-8")
++	w.Header().Set("Cache-Control", "no-store")
++	w.Header().Set("X-Content-Type-Options", "nosniff")
++	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'nonce-"+data.Nonce+"'; style-src 'nonce-"+data.Nonce+"'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
++	if err := landingTemplate.Execute(w, data); err != nil {
++		return
++	}
++}
+diff --git a/cmd/rdpgw/web/landing.html b/cmd/rdpgw/web/landing.html
+new file mode 100644
+--- /dev/null
++++ b/cmd/rdpgw/web/landing.html
+@@ -0,0 +1,81 @@
++<!doctype html>
++<html lang="zh-CN">
++<head>
++<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
++<title>远程桌面 · RDPGW</title>
++<style nonce="{{.Nonce}}">
++:root{color-scheme:dark;--bg:#10161e;--panel:#18212c;--line:#2b3949;--muted:#9cabbd;--accent:#7ce4c5}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf3fa;font:15px/1.6 system-ui,-apple-system,sans-serif}main{max-width:1060px;margin:0 auto;padding:54px 24px 80px}header{display:flex;justify-content:space-between;gap:24px;align-items:start;margin-bottom:32px}.brand{font-size:12px;letter-spacing:.18em;color:var(--accent)}h1{font-size:32px;line-height:1.25;margin:10px 0}p{margin:8px 0;color:var(--muted)}.account{border:1px solid var(--line);border-radius:24px;padding:6px 14px;overflow-wrap:anywhere}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:22px 0 12px}button{border:1px solid var(--line);border-radius:8px;padding:9px 16px;background:var(--panel);color:inherit;cursor:pointer;font:inherit}button:hover{border-color:var(--accent)}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button.primary{background:var(--accent);color:#082f25;border-color:var(--accent);font-weight:650}button:disabled{opacity:.4;cursor:not-allowed}.machines{display:grid;gap:10px}.machine{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:24px;background:var(--panel);padding:20px 24px;border:1px solid var(--line);border-radius:12px}.address{font:600 16px/1.5 ui-monospace,monospace;overflow-wrap:anywhere}.label{font-size:12px;color:var(--muted)}.state{font-size:13px;white-space:nowrap}.state[data-state="在线"]{color:var(--accent)}.state[data-state="不可达"],.state[data-state="配置无效"]{color:#ffbe89}.checked{display:block;font-size:11px;color:var(--muted)}details{margin-top:24px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 24px}summary{cursor:pointer;font-weight:600}.options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin-top:20px}label{display:block;color:var(--muted);font-size:13px}input,select{width:100%;margin-top:6px;background:var(--bg);color:#edf3fa;border:1px solid var(--line);border-radius:6px;padding:10px;font:inherit}input:disabled{opacity:.45}.hint{font-size:12px}.notice{color:#ffbe89}.hidden{display:none}@media(max-width:680px){main{padding:28px 16px}header{flex-direction:column}.machine{grid-template-columns:1fr auto;gap:12px;padding:16px}.machine form{grid-column:1/-1}.machine button{width:100%}.options{grid-template-columns:1fr}h1{font-size:28px}.toolbar{align-items:start}}
++</style>
++</head>
++<body><main>
++<header><div><div class="brand">RDPGW / REMOTE ACCESS</div><h1>你的远程桌面</h1><p>选择一台机器，下载连接文件并用本地远程桌面客户端打开。</p></div><div class="account">{{.User}}</div></header>
++<div class="toolbar"><div><strong>机器列表</strong><p class="hint">在线表示网关可访问 RDP 端口。不可达时仍可尝试连接。</p></div><button id="refresh" type="button">刷新状态</button></div>
++<p id="refresh-message" role="status" aria-live="polite" class="hint">每 15 秒更新状态</p>
++{{if .Signed}}<p class="notice">当前使用 signed 选机模式，请使用已有的签名连接链接；此页面暂不提供直接选机连接。</p>{{end}}
++<div class="machines" id="machines">
++{{range .Hosts}}<article class="machine" data-machine="{{.Index}}"><div><div class="label">远程桌面</div><div class="address">{{.Address}}</div></div><div class="status-region"><span class="state" data-state="{{.Status}}">● {{.Status}}</span>{{if .Checked}}<time class="checked" datetime="{{.Checked}}">{{.Checked}}</time>{{end}}</div><form action="/connect" method="get" class="connect-form"><input type="hidden" name="host" value="{{.Host}}"><button type="submit" class="primary" {{if or (not .Valid) $.Signed}}disabled{{end}}>连接 ↗</button></form></article>{{end}}
++</div>
++<details><summary>高级连接选项</summary><p class="hint">未修改的选项沿用服务器设置。密码在远程桌面客户端中输入。</p>
++<form id="options" class="options" autocomplete="off">
++<label>桌面登录账户<select name="credential_mode" id="credential-mode"><option value="">沿用服务器登录设置</option><option value="custom">自定义桌面账户</option></select></label>
++<label>用户名<input name="username" maxlength="256" disabled placeholder="留空则由客户端输入"></label>
++<label>域<input name="domain" maxlength="256" disabled placeholder="例如 CONTOSO"></label>
++<label>提示输入凭据<select name="prompt_credentials"><option value="">沿用服务器设置</option><option value="1">是</option><option value="0">否</option></select></label>
++<label>显示模式<select name="fullscreen"><option value="">沿用服务器设置</option><option value="1">全屏</option><option value="0">窗口</option></select></label>
++<label>多显示器<select name="multimon"><option value="">沿用服务器设置</option><option value="1">启用</option><option value="0">关闭</option></select></label>
++<label>窗口宽度<input name="width" type="number" min="200" max="8192" placeholder="沿用服务器设置"></label>
++<label>窗口高度<input name="height" type="number" min="200" max="8192" placeholder="沿用服务器设置"></label>
++<label>音频播放<select name="audiomode"><option value="">沿用服务器设置</option><option value="0">本地播放</option><option value="1">远程播放</option><option value="2">关闭</option></select></label>
++<label>剪贴板<select name="clipboard"><option value="">沿用服务器设置</option>{{if .Caps.Clipboard}}<option value="1">启用</option>{{end}}<option value="0">关闭</option></select></label>
++<label>磁盘重定向<select name="drives"><option value="">沿用服务器设置</option>{{if .Caps.Drive}}<option value="1">启用全部本地磁盘</option>{{end}}<option value="0">关闭</option></select></label>
++<label>打印机<select name="printers"><option value="">沿用服务器设置</option>{{if .Caps.Printer}}<option value="1">启用</option>{{end}}<option value="0">关闭</option></select></label>
++</form><p class="hint">自定义桌面账户只用于桌面登录；网关继续使用你的 OIDC 登录身份。网关策略禁用的重定向无法在此启用。</p>
++<button type="button" id="reset">重置选项</button></details>
++<p id="session-expired" class="notice hidden" role="alert">登录已过期，<a href="/">重新登录</a>后再连接。</p>
++<noscript><p>高级选项与自动刷新需要 JavaScript；连接按钮仍可使用服务器默认设置。刷新浏览器页面可更新状态。</p></noscript>
++</main>
++<script nonce="{{.Nonce}}">
++(()=>{
++ const options=document.getElementById('options'),mode=document.getElementById('credential-mode');
++ function accountFields(){for(const name of ['username','domain']) options.elements.namedItem(name).disabled=mode.value!=='custom'}
++ mode.addEventListener('change',accountFields);
++ document.getElementById('reset').addEventListener('click',()=>{options.reset();accountFields()});
++ for(const form of document.querySelectorAll('.connect-form')) form.addEventListener('submit',event=>{
++  if(!options.reportValidity()){event.preventDefault();return}
++  for(const node of form.querySelectorAll('[data-option]'))node.remove();
++  for(const [name,value] of new FormData(options)){
++   if(value===''&&name!=='username'&&name!=='domain')continue;
++   const field=document.createElement('input');field.type='hidden';field.name=name;field.value=value;field.dataset.option='1';form.append(field);
++  }
++ });
++ function localTimes(root){for(const node of root.querySelectorAll('time[datetime]'))node.textContent=new Date(node.dateTime).toLocaleTimeString()}
++ localTimes(document);
++ let busy=false,expired=false;
++ const refresh=document.getElementById('refresh'),message=document.getElementById('refresh-message');
++ async function update(){
++  if(busy||expired||document.hidden)return;
++  busy=true;refresh.disabled=true;message.textContent='正在检测 RDP 端口…';
++  try{
++   const response=await fetch('/',{credentials:'same-origin',cache:'no-store',redirect:'manual',headers:{'X-Landing-Refresh':'1'}});
++   if(response.status===401||response.type==='opaqueredirect'){
++    expired=true;document.getElementById('session-expired').classList.remove('hidden');
++    for(const button of document.querySelectorAll('.connect-form button'))button.disabled=true;
++    message.textContent='状态更新已暂停';return;
++   }
++   if(!response.ok)throw new Error('status');
++   // Parse into an inert template: refreshed styles carry a different CSP nonce.
++   const fragment=document.createElement('template');fragment.innerHTML=await response.text();
++   const page=fragment.content;
++   if(!page.querySelector('#machines'))throw new Error('page');
++   for(const row of document.querySelectorAll('[data-machine]')){
++    const incoming=page.querySelector('[data-machine="'+row.dataset.machine+'"] .status-region');
++    if(incoming)row.querySelector('.status-region').replaceWith(incoming);
++   }
++   localTimes(document);message.textContent='状态已更新 · 每 15 秒检查';
++  }catch(error){message.textContent='状态刷新失败，保留上次结果。可稍后重试。'}
++  finally{busy=false;refresh.disabled=expired}
++ }
++ refresh.addEventListener('click',update);
++ setInterval(update,15000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)update()});
++})();
++</script></body></html>
+diff --git a/cmd/rdpgw/web/landing_test.go b/cmd/rdpgw/web/landing_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/rdpgw/web/landing_test.go
+@@ -0,0 +1,291 @@
++package web
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/identity"
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/rdp"
++	"golang.org/x/oauth2"
++)
++
++func landingHandler() *Handler {
++	gateway, _ := url.Parse("https://gateway.example")
++	return (&Config{Hosts: []string{"desktop:3390"}, HostSelection: "roundrobin", GatewayAddress: gateway,
++		PAATokenGenerator: paaTokenMock, RedirectCaps: RedirectCaps{true, true, true}}).NewHandler()
++}
++
++func authenticatedRequest(method, path string) *http.Request {
++	req := httptest.NewRequest(method, path, nil)
++	id := identity.NewUser()
++	id.SetUserName("oidc-user@example.com")
++	id.SetAuthenticated(true)
++	return identity.AddToRequestCtx(id, req)
++}
++
++func TestConnectOverrides(t *testing.T) {
++	h := landingHandler()
++	h.rdpOpts = RdpOpts{UsernameTemplate: "{{ username }}\x1f{{ token }}", SplitUserDomain: true}
++	h.enableUserToken = true
++	h.userTokenGenerator = func(ctx context.Context, user string) (string, error) {
++		t.Fatal("custom desktop account generated user token")
++		return "", nil
++	}
++	rr := httptest.NewRecorder()
++	h.HandleDownload(rr, authenticatedRequest("GET", "/connect?host=desktop%3A3390&credential_mode=custom&username=desktop-user&domain=CONTOSO&prompt_credentials=1&fullscreen=0&width=1280&height=720&multimon=0&clipboard=0&drives=0&printers=0&audiomode=0"))
++	if rr.Code != 200 {
++		t.Fatal(rr.Code, rr.Body.String())
++	}
++	data := rdpToMap(strings.Split(rr.Body.String(), rdp.CRLF))
++	expected := map[string]string{"username": "desktop-user", "domain": "CONTOSO", "gatewayaccesstoken": "oidc-user_desktop:3390", "full address": "desktop:3390", "gatewayhostname": "gateway.example", "prompt for credentials": "1", "promptcredentialonce": "0", "screen mode id": "1", "desktopwidth": "1280", "desktopheight": "720", "use multimon": "0", "redirectclipboard": "0", "drivestoredirect": "", "redirectprinters": "0", "audiomode": "0"}
++	for key, value := range expected {
++		if got, ok := data[key]; !ok || got != value {
++			t.Errorf("%s=%q present=%v want %q", key, got, ok, value)
++		}
++	}
++	if rr.Header().Get("Cache-Control") != "no-store" {
++		t.Fatal("download cached")
++	}
++}
++
++func TestConnectTemplateAndEmptyOverrides(t *testing.T) {
++	file, err := os.CreateTemp(t.TempDir(), "default-*.rdp")
++	if err != nil {
++		t.Fatal(err)
++	}
++	io.WriteString(file, "username:s:template-user\r\ndomain:s:TEMPLATE\r\naudiomode:i:2\r\nredirectclipboard:i:0\r\nauthentication level:i:3\r\n")
++	file.Close()
++	h := landingHandler()
++	h.rdpDefaults = file.Name()
++	h.rdpOpts.NoUsername = true
++	rr := httptest.NewRecorder()
++	h.HandleDownload(rr, authenticatedRequest("GET", "/connect"))
++	if rr.Code != 200 {
++		t.Fatal(rr.Body.String())
++	}
++	data := rdpToMap(strings.Split(rr.Body.String(), rdp.CRLF))
++	for key, value := range map[string]string{"username": "template-user", "domain": "TEMPLATE", "audiomode": "2", "redirectclipboard": "0", "authentication level": "3"} {
++		if data[key] != value {
++			t.Errorf("template %s=%q", key, data[key])
++		}
++	}
++	rr = httptest.NewRecorder()
++	h.HandleDownload(rr, authenticatedRequest("GET", "/connect?credential_mode=custom&username=&domain=&clipboard=1&audiomode=0"))
++	if rr.Code != 200 {
++		t.Fatal(rr.Body.String())
++	}
++	data = rdpToMap(strings.Split(rr.Body.String(), rdp.CRLF))
++	for key, value := range map[string]string{"username": "", "domain": "", "audiomode": "0", "redirectclipboard": "1"} {
++		got, ok := data[key]
++		if !ok || got != value {
++			t.Errorf("override %s=%q present=%v", key, got, ok)
++		}
++	}
++}
++
++func TestInvalidConnectOptions(t *testing.T) {
++	for _, query := range []string{"username=other", "credential_mode=bad", "credential_mode=custom&username=a%0d%0afull+address%3As%3Aevil", "credential_mode=custom&domain=a%1fb", "multimon=true", "width=199", "height=8193", "audiomode=3", "clipboard=0&clipboard=1", "host=desktop%3A3390&host=evil", "host=evil", "width=0200"} {
++		t.Run(query, func(t *testing.T) {
++			h := landingHandler()
++			rr := httptest.NewRecorder()
++			h.HandleDownload(rr, authenticatedRequest("GET", "/connect?"+query))
++			if rr.Code != 400 {
++				t.Fatal(rr.Code, rr.Body.String())
++			}
++			if rr.Header().Get("Content-Disposition") != "" {
++				t.Fatal("error advertised attachment")
++			}
++		})
++	}
++	h := landingHandler()
++	h.redirectCaps = RedirectCaps{}
++	for _, key := range []string{"clipboard", "drives", "printers"} {
++		rr := httptest.NewRecorder()
++		h.HandleDownload(rr, authenticatedRequest("GET", "/connect?"+key+"=1"))
++		if rr.Code != 400 {
++			t.Fatal("enabled disabled capability", key)
++		}
++	}
++}
++
++func TestLandingAuthenticationAndRendering(t *testing.T) {
++	h := landingHandler()
++	h.hosts = []string{"desktop:3390", "my-{{ preferred_username }}-host:3391", "invalid:0"}
++	var addresses []string
++	var mu sync.Mutex
++	h.probes.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
++		mu.Lock()
++		addresses = append(addresses, address)
++		mu.Unlock()
++		if strings.HasPrefix(address, "desktop:") {
++			a, b := net.Pipe()
++			b.Close()
++			return a, nil
++		}
++		return nil, errors.New("unreachable")
++	}
++	rr := httptest.NewRecorder()
++	h.HandleLanding(rr, httptest.NewRequest("GET", "/", nil))
++	if rr.Code != 401 {
++		t.Fatal(rr.Code)
++	}
++	req := authenticatedRequest("GET", "/")
++	identity.FromRequestCtx(req).SetUserName("alice")
++	rr = httptest.NewRecorder()
++	h.HandleLanding(rr, req)
++	if rr.Code != 200 {
++		t.Fatal(rr.Code, rr.Body.String())
++	}
++	for _, needle := range []string{"在线", "不可达", "配置无效", "desktop:3390", "my-alice-host:3391", "/connect", "credential_mode", "nonce="} {
++		if !strings.Contains(rr.Body.String(), needle) {
++			t.Errorf("missing %s", needle)
++		}
++	}
++	if len(addresses) != 2 {
++		t.Fatal(addresses)
++	}
++	if rr.Header().Get("Cache-Control") != "no-store" || !strings.Contains(rr.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
++		t.Fatal(rr.Header())
++	}
++	h.hostSelection = "signed"
++	rr = httptest.NewRecorder()
++	h.HandleLanding(rr, authenticatedRequest("GET", "/"))
++	if !strings.Contains(rr.Body.String(), "签名连接链接") {
++		t.Fatal("missing signed warning")
++	}
++}
++
++func TestProbeCacheAndPort(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	go func() {
++		conn, err := listener.Accept()
++		if err == nil {
++			conn.Close()
++		}
++	}()
++	p := newProbeCache()
++	result := p.check(context.Background(), listener.Addr().String())
++	if !result.Online {
++		t.Fatal("explicit port not probed")
++	}
++	listener.Close()
++	if cached := p.check(context.Background(), listener.Addr().String()); cached != result {
++		t.Fatal("cache miss")
++	}
++	p.mu.Lock()
++	p.results[listener.Addr().String()] = probeResult{Checked: time.Now().Add(-probeTTL)}
++	p.mu.Unlock()
++	if p.check(context.Background(), listener.Addr().String()).Online {
++		t.Fatal("stale cache used")
++	}
++}
++
++func TestProbeConcurrencyAndSingleFlight(t *testing.T) {
++	p := newProbeCache()
++	var calls, active, maxActive atomic.Int32
++	p.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
++		calls.Add(1)
++		n := active.Add(1)
++		defer active.Add(-1)
++		for {
++			old := maxActive.Load()
++			if n <= old || maxActive.CompareAndSwap(old, n) {
++				break
++			}
++		}
++		time.Sleep(15 * time.Millisecond)
++		return nil, errors.New("offline")
++	}
++	var wg sync.WaitGroup
++	for i := 0; i < 20; i++ {
++		wg.Add(1)
++		go func() { defer wg.Done(); p.check(context.Background(), "same:3389") }()
++	}
++	wg.Wait()
++	if calls.Load() != 1 {
++		t.Fatal("duplicate probes", calls.Load())
++	}
++	calls.Store(0)
++	for i := 0; i < 24; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			p.check(context.Background(), net.JoinHostPort("host", strconv.Itoa(3300+i)))
++		}(i)
++	}
++	wg.Wait()
++	if maxActive.Load() > 8 {
++		t.Fatal("concurrency limit", maxActive.Load())
++	}
++}
++
++func TestProbeTimeoutCancellationAndIsolation(t *testing.T) {
++	p := newProbeCache()
++	p.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
++		deadline, ok := ctx.Deadline()
++		if !ok || time.Until(deadline) > probeTimeout {
++			t.Error("missing dial timeout")
++		}
++		if address == "my-alice:3389" {
++			a, b := net.Pipe()
++			b.Close()
++			return a, nil
++		}
++		<-ctx.Done()
++		return nil, ctx.Err()
++	}
++	if !p.check(context.Background(), "my-alice:3389").Online {
++		t.Fatal("alice offline")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
++	defer cancel()
++	if p.check(ctx, "my-bob:3389").Online {
++		t.Fatal("user cache leaked")
++	}
++	p.mu.Lock()
++	_, cached := p.results["my-bob:3389"]
++	p.mu.Unlock()
++	if cached {
++		t.Fatal("canceled probe cached")
++	}
++}
++
++func TestOIDCReturnURLAndRefreshExpiry(t *testing.T) {
++	o := (&OIDCConfig{OAuth2Config: &oauth2.Config{ClientID: "client", Endpoint: oauth2.Endpoint{AuthURL: "https://idp.example/auth"}}}).New()
++	req := httptest.NewRequest("GET", "/connect?host=desktop%3A3390&credential_mode=custom&username=desktop-user&domain=CONTOSO", nil)
++	req = identity.AddToRequestCtx(identity.NewUser(), req)
++	rr := httptest.NewRecorder()
++	handler := o.Authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Fatal("unauthenticated") }))
++	handler.ServeHTTP(rr, req)
++	location, err := url.Parse(rr.Header().Get("Location"))
++	if err != nil || rr.Code != 302 {
++		t.Fatal(rr.Code, err)
++	}
++	stored, ok := o.stateStore.Get(location.Query().Get("state"))
++	if !ok || stored != req.RequestURI {
++		t.Fatal("return URL lost", stored)
++	}
++	req = identity.AddToRequestCtx(identity.NewUser(), httptest.NewRequest("GET", "/", nil))
++	req.Header.Set("X-Landing-Refresh", "1")
++	rr = httptest.NewRecorder()
++	handler.ServeHTTP(rr, req)
++	if rr.Code != 401 || rr.Header().Get("Location") != "" {
++		t.Fatal("refresh redirected", rr.Code)
++	}
++}
+diff --git a/cmd/rdpgw/web/oidc.go b/cmd/rdpgw/web/oidc.go
+--- a/cmd/rdpgw/web/oidc.go
++++ b/cmd/rdpgw/web/oidc.go
+@@ -115,6 +115,10 @@
+ 		id := identity.FromRequestCtx(r)
+ 
+ 		if !id.Authenticated() {
++			if r.URL.Path == "/" && r.Header.Get("X-Landing-Refresh") == "1" {
++				http.Error(w, "Unauthorized", http.StatusUnauthorized)
++				return
++			}
+ 			seed := make([]byte, 16)
+ 			_, err := rand.Read(seed)
+ 			if err != nil {
+diff --git a/cmd/rdpgw/web/oidc_flow_test.go b/cmd/rdpgw/web/oidc_flow_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/rdpgw/web/oidc_flow_test.go
+@@ -0,0 +1,84 @@
++package web
++
++import (
++	"context"
++	"crypto/rand"
++	"crypto/rsa"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/identity"
++	"github.com/coreos/go-oidc/v3/oidc"
++	"github.com/go-jose/go-jose/v3"
++	"github.com/go-jose/go-jose/v3/jwt"
++	"golang.org/x/oauth2"
++)
++
++func TestOIDCCallbackPreservesConnectOptions(t *testing.T) {
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var issuer string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch r.URL.Path {
++		case "/.well-known/openid-configuration":
++			json.NewEncoder(w).Encode(map[string]interface{}{"issuer": issuer, "authorization_endpoint": issuer + "/auth", "token_endpoint": issuer + "/token", "jwks_uri": issuer + "/keys", "id_token_signing_alg_values_supported": []string{"RS256"}})
++		case "/keys":
++			json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "test", Algorithm: "RS256", Use: "sig"}}})
++		case "/token":
++			signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: key}, (&jose.SignerOptions{}).WithHeader("kid", "test"))
++			if err != nil {
++				http.Error(w, err.Error(), 500)
++				return
++			}
++			token, err := jwt.Signed(signer).Claims(jwt.Claims{Issuer: issuer, Subject: "opaque-subject", Audience: jwt.Audience{"test-client"}, Expiry: jwt.NewNumericDate(time.Now().Add(time.Minute)), IssuedAt: jwt.NewNumericDate(time.Now())}).Claims(map[string]interface{}{"preferred_username": "oidc-user"}).CompactSerialize()
++			if err != nil {
++				http.Error(w, err.Error(), 500)
++				return
++			}
++			json.NewEncoder(w).Encode(map[string]interface{}{"access_token": "test-access", "token_type": "Bearer", "id_token": token, "expires_in": 60})
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	defer server.Close()
++	issuer = server.URL
++	provider, err := oidc.NewProvider(context.Background(), issuer)
++	if err != nil {
++		t.Fatal(err)
++	}
++	o := (&OIDCConfig{OAuth2Config: &oauth2.Config{ClientID: "test-client", ClientSecret: "test-secret", RedirectURL: "https://gateway.example/callback", Endpoint: provider.Endpoint()}, OIDCTokenVerifier: provider.Verifier(&oidc.Config{ClientID: "test-client"})}).New()
++	InitStore([]byte("01234567890123456789012345678901"), []byte("01234567890123456789012345678901"), "cookie", 0)
++	original := "/connect?host=desktop%3A3390&credential_mode=custom&username=desktop-user&domain=CONTOSO&clipboard=0"
++	start := identity.AddToRequestCtx(identity.NewUser(), httptest.NewRequest("GET", original, nil))
++	redirect := httptest.NewRecorder()
++	o.Authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Fatal("unauthenticated connect") })).ServeHTTP(redirect, start)
++	authURL, _ := url.Parse(redirect.Header().Get("Location"))
++	callback := identity.AddToRequestCtx(identity.NewUser(), httptest.NewRequest("GET", "/callback?code=test-code&state="+authURL.Query().Get("state"), nil))
++	rr := httptest.NewRecorder()
++	o.HandleCallback(rr, callback)
++	if rr.Code != 302 || rr.Header().Get("Location") != original {
++		t.Fatal(rr.Code, rr.Header(), rr.Body.String())
++	}
++	request := httptest.NewRequest("GET", rr.Header().Get("Location"), nil)
++	for _, cookie := range rr.Result().Cookies() {
++		request.AddCookie(cookie)
++	}
++	download := httptest.NewRecorder()
++	h := landingHandler()
++	EnrichContext(o.Authenticated(http.HandlerFunc(h.HandleDownload))).ServeHTTP(download, request)
++	if download.Code != 200 {
++		t.Fatal(download.Code, download.Body.String())
++	}
++	data := rdpToMap(strings.Split(download.Body.String(), "\r\n"))
++	if data["username"] != "desktop-user" || data["domain"] != "CONTOSO" || data["gatewayaccesstoken"] != "oidc-user_desktop:3390" || data["redirectclipboard"] != "0" {
++		t.Fatal(data)
++	}
++}
+diff --git a/cmd/rdpgw/web/options.go b/cmd/rdpgw/web/options.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/rdpgw/web/options.go
+@@ -0,0 +1,124 @@
++package web
++
++import (
++	"fmt"
++	"net/url"
++	"strconv"
++	"unicode"
++
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/rdp"
++)
++
++// RedirectCaps limits overrides to the capabilities advertised by the gateway.
++type RedirectCaps struct{ Clipboard, Drive, Printer bool }
++
++type connectOptions struct {
++	custom           bool
++	username, domain string
++	values           map[string]int
++}
++
++func parseConnectOptions(q url.Values) (connectOptions, error) {
++	o := connectOptions{values: make(map[string]int)}
++	keys := []string{"credential_mode", "username", "domain", "prompt_credentials", "fullscreen", "width", "height", "multimon", "clipboard", "drives", "printers", "audiomode"}
++	for _, key := range keys {
++		if v, ok := q[key]; ok && len(v) != 1 {
++			return o, fmt.Errorf("duplicate parameter: %s", key)
++		}
++	}
++	mode := q.Get("credential_mode")
++	if mode != "" && mode != "default" && mode != "custom" {
++		return o, fmt.Errorf("invalid credential_mode")
++	}
++	o.custom = mode == "custom"
++	for _, key := range []string{"username", "domain"} {
++		v, present := q[key]
++		if !present {
++			continue
++		}
++		if !o.custom {
++			return o, fmt.Errorf("%s requires credential_mode=custom", key)
++		}
++		if len(v[0]) > 256 {
++			return o, fmt.Errorf("%s is too long", key)
++		}
++		for _, ch := range v[0] {
++			if unicode.IsControl(ch) {
++				return o, fmt.Errorf("invalid %s", key)
++			}
++		}
++	}
++	o.username, o.domain = q.Get("username"), q.Get("domain")
++	for _, key := range keys[3:] {
++		values, present := q[key]
++		if !present {
++			continue
++		}
++		v, err := strconv.Atoi(values[0])
++		if err != nil {
++			return o, fmt.Errorf("invalid %s", key)
++		}
++		low, high := 0, 1
++		if key == "width" || key == "height" {
++			low, high = 200, 8192
++		}
++		if key == "audiomode" {
++			high = 2
++		}
++		if v < low || v > high || strconv.Itoa(v) != values[0] {
++			return o, fmt.Errorf("invalid %s", key)
++		}
++		o.values[key] = v
++	}
++	return o, nil
++}
++
++func (o connectOptions) apply(d *rdp.Builder, caps RedirectCaps) error {
++	for key, allowed := range map[string]bool{"clipboard": caps.Clipboard, "drives": caps.Drive, "printers": caps.Printer} {
++		if v, ok := o.values[key]; ok && v == 1 && !allowed {
++			return fmt.Errorf("%s is disabled by gateway policy", key)
++		}
++	}
++	if o.custom {
++		d.Settings.Username, d.Settings.Domain = o.username, o.domain
++		d.MarkExplicit("Username", "Domain")
++		// Desktop and gateway credentials must be requested independently.
++		d.Settings.PromptCredentialsOnce = false
++		d.MarkExplicit("PromptCredentialsOnce")
++	}
++	for key, v := range o.values {
++		switch key {
++		case "prompt_credentials":
++			d.Settings.PromptForCredentials = v == 1
++			d.MarkExplicit("PromptForCredentials")
++		case "fullscreen":
++			d.Settings.ScreenModeId = v + 1
++			d.MarkExplicit("ScreenModeId")
++		case "width":
++			d.Settings.DesktopWidth = v
++			d.MarkExplicit("DesktopWidth")
++		case "height":
++			d.Settings.DesktopHeight = v
++			d.MarkExplicit("DesktopHeight")
++		case "multimon":
++			d.Settings.UseMultimon = v == 1
++			d.MarkExplicit("UseMultimon")
++		case "clipboard":
++			d.Settings.RedirectClipboard = v == 1
++			d.MarkExplicit("RedirectClipboard")
++		case "drives":
++			d.Settings.DriveStoreRedirect = ""
++			if v == 1 {
++				d.Settings.DriveStoreRedirect = "*"
++			}
++			d.MarkExplicit("DriveStoreRedirect")
++		case "printers":
++			d.Settings.RedirectPrinters = v == 1
++			d.MarkExplicit("RedirectPrinters")
++		case "audiomode":
++			d.Settings.AudioMode = v
++			d.MarkExplicit("AudioMode")
++		}
++	}
++	return nil
++}
+diff --git a/cmd/rdpgw/web/web.go b/cmd/rdpgw/web/web.go
+--- a/cmd/rdpgw/web/web.go
++++ b/cmd/rdpgw/web/web.go
+@@ -8,6 +8,7 @@
+ 	"fmt"
+ 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/identity"
+ 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/rdp"
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/target"
+ 	"hash/maphash"
+ 	"log"
+ 	rnd "math/rand"
+@@ -32,6 +33,7 @@
+ 	GatewayAddress     *url.URL
+ 	RdpOpts            RdpOpts
+ 	TemplateFile       string
++	RedirectCaps       RedirectCaps
+ }
+ 
+ type RdpOpts struct {
+@@ -51,6 +53,8 @@
+ 	hostSelection      string
+ 	rdpOpts            RdpOpts
+ 	rdpDefaults        string
++	redirectCaps       RedirectCaps
++	probes             *probeCache
+ }
+ 
+ func (c *Config) NewHandler() *Handler {
+@@ -69,6 +73,8 @@
+ 		hostSelection:      c.HostSelection,
+ 		rdpOpts:            c.RdpOpts,
+ 		rdpDefaults:        c.TemplateFile,
++		redirectCaps:       c.RedirectCaps,
++		probes:             newProbeCache(),
+ 	}
+ }
+ 
+@@ -79,9 +85,23 @@
+ }
+ 
+ func (h *Handler) getHost(ctx context.Context, u *url.URL) (string, error) {
++	if len(u.Query()["host"]) > 1 {
++		return "", errors.New("duplicate host parameter")
++	}
+ 	switch h.hostSelection {
+ 	case "roundrobin":
+-		return h.selectRandomHost(), nil
++		if _, supplied := u.Query()["host"]; !supplied {
++			return h.selectRandomHost(), nil
++		}
++		fallthrough
++	case "unsigned":
++		selected := u.Query().Get("host")
++		for _, allowed := range h.hosts {
++			if selected == allowed {
++				return allowed, nil
++			}
++		}
++		return "", errors.New("invalid host specified in query parameter")
+ 	case "signed":
+ 		hosts, ok := u.Query()["host"]
+ 		if !ok {
+@@ -103,19 +123,6 @@
+ 			return "", errors.New("invalid host specified in query token")
+ 		}
+ 		return host, nil
+-	case "unsigned":
+-		hosts, ok := u.Query()["host"]
+-		if !ok {
+-			return "", errors.New("invalid query parameter")
+-		}
+-		for _, check := range h.hosts {
+-			if check == hosts[0] {
+-				return hosts[0], nil
+-			}
+-		}
+-		// not found
+-		log.Printf("Invalid host %s specified in client request", hosts[0])
+-		return "", errors.New("invalid host specified in query parameter")
+ 	case "any":
+ 		hosts, ok := u.Query()["host"]
+ 		if !ok {
+@@ -133,9 +140,15 @@
+ 
+ 	opts := h.rdpOpts
+ 
+-	if !id.Authenticated() {
+-		log.Printf("unauthenticated user %s", id.UserName())
++	if id == nil || !id.Authenticated() {
++		log.Printf("unauthenticated download request")
+ 		http.Error(w, errors.New("cannot find session or user").Error(), http.StatusInternalServerError)
++		return
++	}
++
++	overrides, err := parseConnectOptions(r.URL.Query())
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadRequest)
+ 		return
+ 	}
+ 
+@@ -145,7 +158,12 @@
+ 		http.Error(w, err.Error(), http.StatusBadRequest)
+ 		return
+ 	}
+-	host = strings.Replace(host, "{{ preferred_username }}", id.UserName(), 1)
++	host = strings.ReplaceAll(host, "{{ preferred_username }}", id.UserName())
++	host, err = target.Address(host)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
+ 
+ 	// split the username into user and domain
+ 	var user = id.UserName()
+@@ -159,7 +177,7 @@
+ 	}
+ 
+ 	render := user
+-	if opts.UsernameTemplate != "" {
++	if opts.UsernameTemplate != "" && !overrides.custom {
+ 		render = fmt.Sprintf(h.rdpOpts.UsernameTemplate)
+ 		render = strings.Replace(render, "{{ username }}", user, 1)
+ 		if h.rdpOpts.UsernameTemplate == render {
+@@ -176,7 +194,7 @@
+ 		return
+ 	}
+ 
+-	if h.enableUserToken {
++	if h.enableUserToken && !overrides.custom {
+ 		userToken, err := h.userTokenGenerator(ctx, user)
+ 		if err != nil {
+ 			log.Printf("Cannot generate token for user %s due to %s", user, err)
+@@ -195,9 +213,6 @@
+ 		return
+ 	}
+ 	fn := hex.EncodeToString(seed) + ".rdp"
+-
+-	w.Header().Set("Content-Disposition", "attachment; filename="+fn)
+-	w.Header().Set("Content-Type", "application/x-rdp")
+ 
+ 	var d *rdp.Builder
+ 	if h.rdpDefaults == "" {
+@@ -217,6 +232,10 @@
+ 			d.Settings.Domain = domain
+ 		}
+ 	}
++	if err := overrides.apply(d, h.redirectCaps); err != nil {
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
+ 	d.Settings.FullAddress = host
+ 	d.Settings.GatewayHostname = h.gatewayAddress.Host
+ 	d.Settings.GatewayCredentialsSource = rdp.SourceCookie
+@@ -224,5 +243,9 @@
+ 	d.Settings.GatewayCredentialMethod = 1
+ 	d.Settings.GatewayUsageMethod = 1
+ 
++	w.Header().Set("Content-Disposition", "attachment; filename="+fn)
++	w.Header().Set("Content-Type", "application/x-rdp")
++	w.Header().Set("Cache-Control", "no-store")
++	w.Header().Set("X-Content-Type-Options", "nosniff")
+ 	http.ServeContent(w, r, fn, time.Now(), strings.NewReader(d.String()))
+ }
+diff --git a/cmd/rdpgw/web/web_test.go b/cmd/rdpgw/web/web_test.go
+--- a/cmd/rdpgw/web/web_test.go
++++ b/cmd/rdpgw/web/web_test.go
+@@ -5,6 +5,7 @@
+ 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/identity"
+ 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/rdp"
+ 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/security"
++	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/target"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"net/url"
+@@ -25,7 +26,8 @@
+ 
+ func contains(needle string, haystack []string) bool {
+ 	for _, val := range haystack {
+-		if val == needle {
++		normalized, _ := target.Address(val)
++		if val == needle || normalized == needle {
+ 			return true
+ 		}
+ 	}
